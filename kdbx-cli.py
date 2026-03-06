@@ -2,6 +2,8 @@
 """Python3 wrapper around kpcli for KeePass KDBX v2.x databases."""
 
 import argparse
+import getpass
+import hashlib
 import json
 import os
 import pty
@@ -13,6 +15,7 @@ import sys
 import time
 
 TIMEOUT = 15
+CACHE_TTL = 9000  # 2.5 hours
 
 
 def strip_ansi(text):
@@ -27,6 +30,67 @@ def output_json(data):
 def error(msg):
     print(json.dumps({"error": msg}, ensure_ascii=False))
     sys.exit(1)
+
+
+def validate_env_varname(name):
+    if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name):
+        error(f"Invalid environment variable name: '{name}'")
+
+
+# ── Password caching ─────────────────────────────────────────────────
+
+
+def _cache_path(db_path):
+    username = getpass.getuser()
+    db_hash = hashlib.md5(os.path.abspath(db_path).encode()).hexdigest()
+    return f"/tmp/kdbx_cache_{username}_{db_hash}.txt"
+
+
+def _write_cache(db_path, password):
+    path = _cache_path(db_path)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(f"{int(time.time())}\n{password}")
+
+
+def _read_cache(db_path):
+    path = _cache_path(db_path)
+    try:
+        st = os.stat(path)
+        if st.st_mode & 0o077:
+            return None
+        with open(path) as f:
+            lines = f.read().split('\n', 1)
+            if len(lines) < 2:
+                return None
+            ts = int(lines[0])
+            if time.time() - ts > CACHE_TTL:
+                os.remove(path)
+                return None
+            return lines[1]
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def _delete_cache(db_path):
+    try:
+        os.remove(_cache_path(db_path))
+    except FileNotFoundError:
+        pass
+
+
+def resolve_password(args):
+    """Resolve password: explicit --password > KDBX_PASSWORD env > cache > error."""
+    if getattr(args, 'password', None):
+        return args.password
+    env_pw = os.environ.get('KDBX_PASSWORD')
+    if env_pw:
+        return env_pw
+    if getattr(args, 'db', None):
+        cached = _read_cache(args.db)
+        if cached:
+            return cached
+    error("No password provided. Use --password, KDBX_PASSWORD env var, or 'login' to cache.")
 
 
 def find_kpcli():
@@ -47,12 +111,12 @@ def check_db(db_path):
             pass
 
 
-def check_output_for_errors(text):
+def check_output_for_errors(text, db_path=None):
     low = text.lower()
     if "couldn't load the file" in low:
-        error("Failed to open database (wrong password or corrupted file)")
+        error("Wrong master password (or corrupted/incompatible database file)")
     if "file does not exist" in low:
-        error("Database file not found")
+        error(f"Database file not found: {db_path}" if db_path else "Database file not found")
 
 
 # ── Command mode (read-only operations) ──────────────────────────────
@@ -77,7 +141,7 @@ def run_kpcli_command(db_path, password, commands):
 
     stdout = strip_ansi(stdout_b.decode("utf-8", errors="replace"))
     stderr = strip_ansi(stderr_b.decode("utf-8", errors="replace"))
-    check_output_for_errors(stdout + "\n" + stderr)
+    check_output_for_errors(stdout + "\n" + stderr, db_path)
     return stdout
 
 
@@ -246,23 +310,83 @@ def parse_show(raw):
 # ── Commands ─────────────────────────────────────────────────────────
 
 
-def cmd_list(args):
-    check_db(args.db)
+def _recursive_list(db_path, password, base_path=""):
+    """Recursively list all entries, returning them grouped by path."""
     commands = []
-    if args.path:
-        commands.append(f"cd /{args.path}")
+    if base_path:
+        commands.append(f"cd /{base_path}")
     commands.append("ls")
-    raw = run_kpcli_command(args.db, args.password, commands)
-    output_json(parse_ls(raw))
+    raw = run_kpcli_command(db_path, password, commands)
+    parsed = parse_ls(raw)
+
+    prefix = f"{base_path}/" if base_path else ""
+    result = {}
+
+    # Entries at this level
+    entry_paths = [f"{prefix}{e['title']}" for e in parsed["entries"]]
+    group_name = base_path or "Root"
+    if entry_paths or not parsed["groups"]:
+        result[group_name] = {"entries": entry_paths}
+
+    # Recurse into subgroups
+    for group in parsed["groups"]:
+        sub_path = f"{prefix}{group}"
+        result.update(_recursive_list(db_path, password, sub_path))
+
+    return result
+
+
+def cmd_list(args):
+    args.password = resolve_password(args)
+    check_db(args.db)
+    if getattr(args, 'verbose', False):
+        result = _recursive_list(args.db, args.password, args.path or "")
+        output_json(result)
+    else:
+        commands = []
+        if args.path:
+            commands.append(f"cd /{args.path}")
+        commands.append("ls")
+        raw = run_kpcli_command(args.db, args.password, commands)
+        output_json(parse_ls(raw))
+
+
+def _fuzzy_find_entries(db_path, password, search_term):
+    """Search for entries with similar names for suggestions."""
+    try:
+        raw = run_kpcli_command(db_path, password, [f"find {search_term}"])
+        matches = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if line.startswith("/") and not line.endswith("/"):
+                matches.append(line)
+        return matches[:5]
+    except SystemExit:
+        return []
 
 
 def cmd_get(args):
+    args.password = resolve_password(args)
     check_db(args.db)
     path = args.path if args.path.startswith("/") else "/" + args.path
     raw = run_kpcli_command(args.db, args.password, [f"show -f {path}"])
     entry = parse_show(raw)
     if not entry:
+        search_term = args.path.split("/")[-1]
+        suggestions = _fuzzy_find_entries(args.db, args.password, search_term)
+        if suggestions:
+            error(f"Entry not found: {args.path}. Did you mean: {', '.join(suggestions)}")
         error(f"Entry not found: {args.path}")
+
+    # --decrypt-to-env: output as shell export statement
+    if getattr(args, 'decrypt_to_env', None):
+        varname = args.decrypt_to_env
+        validate_env_varname(varname)
+        value = entry.get("password", "")
+        escaped = value.replace("'", "'\\''")
+        print(f"export {varname}='{escaped}'")
+        sys.exit(0)
+
     output_json(entry)
 
 
@@ -283,6 +407,7 @@ def _ensure_groups(db_path, password, group_path):
 
 
 def cmd_add(args):
+    args.password = resolve_password(args)
     check_db(args.db)
 
     path = args.path
@@ -343,6 +468,7 @@ def cmd_add(args):
 
 
 def cmd_delete(args):
+    args.password = resolve_password(args)
     check_db(args.db)
     path = args.path if args.path.startswith("/") else "/" + args.path
 
@@ -367,12 +493,29 @@ def cmd_delete(args):
         error(f"Failed to delete entry: {e}")
 
 
+# ── Login / Logout ────────────────────────────────────────────────────
+
+
+def cmd_login(args):
+    check_db(args.db)
+    # Validate password by opening the database
+    run_kpcli_command(args.db, args.password, ["ver"])
+    _write_cache(args.db, args.password)
+    output_json({"status": "ok", "message": "Password cached", "ttl_seconds": CACHE_TTL})
+
+
+def cmd_logout(args):
+    _delete_cache(args.db)
+    output_json({"status": "ok", "message": "Cache cleared"})
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 
 def add_common_args(p):
     p.add_argument("--db", required=True, help="Path to .kdbx database file")
-    p.add_argument("--password", required=True, help="Master password")
+    p.add_argument("--password", default=None,
+                   help="Master password (or use KDBX_PASSWORD env var or 'login' cache)")
 
 
 def main():
@@ -384,10 +527,14 @@ def main():
 
     p_list = sub.add_parser("list", help="List groups and entries")
     p_list.add_argument("path", nargs="?", default="", help="Group path")
+    p_list.add_argument("--verbose", "-v", action="store_true",
+                        help="Show entries under each group recursively")
     add_common_args(p_list)
 
     p_get = sub.add_parser("get", help="Get entry details")
     p_get.add_argument("path", help="Path to entry")
+    p_get.add_argument("--decrypt-to-env", metavar="VARNAME", default=None,
+                       help="Output as 'export VARNAME=value' for shell eval")
     add_common_args(p_get)
 
     p_add = sub.add_parser("add", help="Add a new entry")
@@ -402,8 +549,19 @@ def main():
     p_del.add_argument("path", help="Path to entry")
     add_common_args(p_del)
 
+    p_login = sub.add_parser("login", help="Cache database password for 2.5 hours")
+    p_login.add_argument("--db", required=True, help="Path to .kdbx database file")
+    p_login.add_argument("--password", required=True, help="Master password")
+
+    p_logout = sub.add_parser("logout", help="Clear cached password")
+    p_logout.add_argument("--db", required=True, help="Path to .kdbx database file")
+
     args = parser.parse_args()
-    {"list": cmd_list, "get": cmd_get, "add": cmd_add, "delete": cmd_delete}[args.command](args)
+    cmds = {
+        "list": cmd_list, "get": cmd_get, "add": cmd_add, "delete": cmd_delete,
+        "login": cmd_login, "logout": cmd_logout,
+    }
+    cmds[args.command](args)
 
 
 if __name__ == "__main__":
