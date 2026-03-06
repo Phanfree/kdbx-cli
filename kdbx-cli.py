@@ -19,7 +19,13 @@ CACHE_TTL = 9000  # 2.5 hours
 
 
 def strip_ansi(text):
-    return re.sub(r'\x1b\[[\x20-\x3f]*[\x40-\x7e]', '', text)
+    return re.sub(
+        r'\x1b\[[0-9;]*[a-zA-Z]'       # CSI sequences (e.g. colors, cursor)
+        r'|\x1b\].*?(?:\x07|\x1b\\)'    # OSC sequences (e.g. terminal title)
+        r'|\x1b[()][AB012]'             # Character set selection
+        r'|\x1b\[[\x20-\x3f]*[\x40-\x7e]',  # Remaining CSI variants
+        '', text
+    )
 
 
 def output_json(data):
@@ -274,7 +280,8 @@ def parse_show(raw):
         "Title": "title", "Uname": "username", "Pass": "password",
         "URL": "url", "Notes": "notes", "Tags": "tags",
     }
-    noise = {"please consider supporting", "github.com/sponsors", "kpcli:/>"}
+    noise = {"please consider supporting", "github.com/sponsors", "donate",
+             "sponsor", "kpcli:/", "kpcli:>"}
 
     result = {}
     current_key = None
@@ -371,12 +378,19 @@ def cmd_get(args):
     path = args.path if args.path.startswith("/") else "/" + args.path
     raw = run_kpcli_command(args.db, args.password, [f"show -f {path}"])
     entry = parse_show(raw)
+
+    # Retry once on parse failure — kpcli output can vary between runs
+    if not entry:
+        raw = run_kpcli_command(args.db, args.password, [f"show -f {path}"])
+        entry = parse_show(raw)
+
     if not entry:
         search_term = args.path.split("/")[-1]
         suggestions = _fuzzy_find_entries(args.db, args.password, search_term)
+        hint = f" (kpcli returned {len(raw)} bytes)" if raw.strip() else ""
         if suggestions:
-            error(f"Entry not found: {args.path}. Did you mean: {', '.join(suggestions)}")
-        error(f"Entry not found: {args.path}")
+            error(f"Entry not found: {args.path}{hint}. Did you mean: {', '.join(suggestions)}")
+        error(f"Entry not found: {args.path}{hint}")
 
     # --decrypt-to-env: output as shell export statement
     if getattr(args, 'decrypt_to_env', None):
