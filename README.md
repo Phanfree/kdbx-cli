@@ -6,8 +6,10 @@ Python3 wrapper around **kpcli** for automated KeePass KDBX v2.x database manage
 
 - ✅ **add** — Create entries with auto-mkdir for nested groups
 - ✅ **get** — Retrieve entry password/metadata
-- ✅ **list** — Show groups and entries
+- ✅ **get --decrypt-to-env** — Export password as shell variable (`export VAR=value`)
+- ✅ **list** — Show groups and entries (with `--verbose` for recursive details)
 - ✅ **delete** — Remove entries
+- ✅ **login / logout** — Cache master password for 2.5 hours (avoids repeated prompts)
 - ✅ **No external dependencies** — Uses stdlib only + kpcli (system tool)
 
 ## Requirements
@@ -30,21 +32,34 @@ chmod +x /usr/local/bin/kdbx-cli.py
 ## Usage
 
 ```bash
-# List all groups and entries
-python3 kdbx-cli.py list --db mydb.kdbx --password "mypassword"
+# Cache password (valid for 2.5 hours)
+python3 kdbx-cli.py login --db mydb.kdbx --password "mypassword"
 
-# Get entry password
-python3 kdbx-cli.py get "services/github/token" --db mydb.kdbx --password "mypassword"
+# List all groups and entries
+python3 kdbx-cli.py list --db mydb.kdbx
+
+# List with recursive entry details
+python3 kdbx-cli.py list --verbose --db mydb.kdbx
+
+# Get entry password (JSON output)
+python3 kdbx-cli.py get "services/github/token" --db mydb.kdbx
+
+# Get password as shell export (for eval)
+eval $(python3 kdbx-cli.py get "services/github/token" --decrypt-to-env GITHUB_TOKEN --db mydb.kdbx)
 
 # Add new entry (creates groups if needed)
 python3 kdbx-cli.py add "services/github/token" "ghp_xxx" \
   --username "myusername" \
-  --db mydb.kdbx \
-  --password "mypassword"
+  --db mydb.kdbx
 
 # Delete entry
-python3 kdbx-cli.py delete "services/github/token" --db mydb.kdbx --password "mypassword"
+python3 kdbx-cli.py delete "services/github/token" --db mydb.kdbx
+
+# Clear cached password
+python3 kdbx-cli.py logout --db mydb.kdbx
 ```
+
+> **Note:** `--password` can be omitted if you used `login` or set the `KDBX_PASSWORD` env var.
 
 ## Output Format
 
@@ -65,6 +80,9 @@ All commands return JSON:
   "url": "",
   "notes": ""
 }
+
+# get --decrypt-to-env GITHUB_TOKEN
+export GITHUB_TOKEN='ghp_xxx'
 
 # add/delete
 {
